@@ -19,6 +19,7 @@ from archiver import (
     Config, Suwayomi, available_folders, chapter_fingerprint,
     collect_chapter_units, find_manga_dir, load_policies, load_state,
     resolve_completed, resolve_folder, run_once, safe_name, build_folder_index,
+    optimize_existing_book, resolve_library_book, optimization_signature, book_paths, save_state,
 )
 
 log = logging.getLogger("manga-archiver.web")
@@ -46,6 +47,11 @@ FIELDS = {
     "output_name_template": ("输出文件模板", "text"),
     "request_timeout": ("API 超时 / 秒", "number"),
     "max_zip_entry_mb": ("单页限制 / MB", "number"),
+    "optimize_images": ("图片缩放及压缩（仅当新图更小时替换）", "checkbox"),
+    "image_max_width": ("最大宽度 / 像素", "number"),
+    "image_max_height": ("最大高度 / 像素", "number"),
+    "image_quality": ("JPEG 质量（1–95）", "number"),
+    "pages_per_book": ("每册最多页数（0 = 不拆分）", "number"),
     "move_source": ("归档后删除源章节（高风险）", "checkbox"),
     "dry_run": ("自动任务只预演", "checkbox"),
 }
@@ -99,7 +105,9 @@ def form_settings(form):
             settings[key] = load_settings().get(key, os.environ.get("SUWAYOMI_PASS", ""))
         elif kind == "number":
             number = int(value)
-            if number < (0 if key == "interval_seconds" else 1) or number > 864000:
+            if number < (0 if key in ("interval_seconds", "pages_per_book") else 1) or number > 864000:
+                raise ValueError(f"{key} 超出允许范围")
+            if key == "image_quality" and number > 95:
                 raise ValueError(f"{key} 超出允许范围")
             settings[key] = number
         else:
@@ -140,14 +148,25 @@ def folder_details(cfg, relative):
     return path, units
 
 
-def run_job(dry_run=False, target=None, folder=None, force=False):
+def run_job(dry_run=False, target=None, folder=None, force=False, library_book=None):
     global RUNNING, LAST_RUN
-    label = f"漫画 #{target}" if target is not None else (f"文件夹 {folder}" if folder else "自动巡检")
+    label = f"库内文件 {library_book}" if library_book else (f"漫画 #{target}" if target is not None else (f"文件夹 {folder}" if folder else "自动巡检"))
     try:
         cfg = configured()
-        if target is not None or folder is not None:
+        if target is not None or folder is not None or library_book:
             cfg.dry_run = dry_run
-        stats = run_once(cfg, target=target, folder=folder, force=force)
+        if library_book:
+            stats = optimize_existing_book(cfg, library_book, dry_run=dry_run)
+            if not dry_run:
+                state = load_state(cfg.state_file)
+                source = str(cfg.komga_library / library_book)
+                for record in state.values():
+                    if isinstance(record, dict) and record.get("output") == source:
+                        record["outputs"] = [str(p) for p in book_paths(Path(source), stats["books"])]
+                        record["optimization"] = optimization_signature(cfg)
+                save_state(cfg.state_file, state)
+        else:
+            stats = run_once(cfg, target=target, folder=folder, force=force)
         message = f"{datetime.now():%m-%d %H:%M} · {label} · {'预演' if cfg.dry_run else '归档'} · {stats}"
     except Exception as exc:
         log.exception("归档任务失败")
@@ -158,13 +177,13 @@ def run_job(dry_run=False, target=None, folder=None, force=False):
         RUNNING = False
 
 
-def start_job(dry_run=False, target=None, folder=None, force=False):
+def start_job(dry_run=False, target=None, folder=None, force=False, library_book=None):
     global RUNNING
     with LOCK:
         if RUNNING:
             return False
         RUNNING = True
-    threading.Thread(target=run_job, args=(dry_run, target, folder, force), daemon=True).start()
+    threading.Thread(target=run_job, args=(dry_run, target, folder, force, library_book), daemon=True).start()
     return True
 
 
@@ -208,7 +227,7 @@ def layout(title, section, body, message="", warning=False):
     notice = f'<div class="notice {"warning" if warning else ""}">{escape(message)}</div>' if message else ""
     with LOCK:
         running = RUNNING
-    return f'''<!doctype html><html lang="zh-CN"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>{escape(title)} · Manga Archiver</title><style>{STYLE}</style></head><body><div class="shell"><aside><strong>◈ Manga Archive</strong><small>Suwayomi → Komga</small><nav>{nav_link('/', '◫　控制台', section)}{nav_link('/mangas', '▤　漫画管理', section)}{nav_link('/folders', '▥　文件夹管理', section)}{nav_link('/settings', '⚙　功能配置', section)}</nav></aside><main><header><div><div class="eyebrow">LIBRARY CONTROL CENTER</div><h1>{escape(title)}</h1></div><span class="badge">{'● 正在执行' if running else '● 系统空闲'}</span></header>{notice}{body}</main></div></body></html>'''
+    return f'''<!doctype html><html lang="zh-CN"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>{escape(title)} · Manga Archiver</title><style>{STYLE}</style></head><body><div class="shell"><aside><strong>◈ Manga Archive</strong><small>Suwayomi → Komga</small><nav>{nav_link('/', '◫　控制台', section)}{nav_link('/mangas', '▤　漫画管理', section)}{nav_link('/folders', '▥　文件夹管理', section)}{nav_link('/library', '▧　已合并优化', section)}{nav_link('/settings', '⚙　功能配置', section)}</nav></aside><main><header><div><div class="eyebrow">LIBRARY CONTROL CENTER</div><h1>{escape(title)}</h1></div><span class="badge">{'● 正在执行' if running else '● 系统空闲'}</span></header>{notice}{body}</main></div></body></html>'''
 
 
 class Handler(BaseHTTPRequestHandler):
@@ -251,7 +270,8 @@ class Handler(BaseHTTPRequestHandler):
                 self.respond(200, "ok", "text/plain; charset=utf-8")
                 return
             pages = {"/": self.dashboard, "/mangas": self.mangas, "/folders": self.folders,
-                     "/manga": self.manga_detail, "/folder": self.folder_detail, "/settings": self.settings}
+                     "/manga": self.manga_detail, "/folder": self.folder_detail, "/settings": self.settings,
+                     "/library": self.library_books}
             page = pages.get(url.path)
             if not page:
                 self.respond(404, "页面不存在")
@@ -265,14 +285,14 @@ class Handler(BaseHTTPRequestHandler):
             return
         url = urlsplit(self.path)
         length = self.headers.get("Content-Length", "")
-        if url.path not in ("/settings", "/manual", "/policy", "/run") or not length.isdigit() or int(length) > MAX_BODY:
+        if url.path not in ("/settings", "/manual", "/policy", "/run", "/optimize") or not length.isdigit() or int(length) > MAX_BODY:
             self.respond(400, "无效请求")
             return
         form = parse_qs(self.rfile.read(int(length)).decode("utf-8", "replace"), keep_blank_values=True)
         if not hmac.compare_digest(form.get("csrf", [""])[0], TOKEN):
             self.respond(403, "请求校验失败")
             return
-        destination = "/settings" if url.path in ("/settings", "/manual") else ("/mangas" if form.get("kind") == ["manga"] else "/folders")
+        destination = "/settings" if url.path in ("/settings", "/manual") else ("/library" if url.path == "/optimize" else ("/mangas" if form.get("kind") == ["manga"] else "/folders"))
         try:
             if url.path == "/settings":
                 save_text(SETTINGS_FILE, json.dumps(form_settings(form), ensure_ascii=False, indent=2))
@@ -282,6 +302,16 @@ class Handler(BaseHTTPRequestHandler):
                 message = "手动完结清单已保存"
             elif url.path == "/policy":
                 destination, message = self.save_policy(form)
+            elif url.path == "/optimize":
+                relative = form.get("book", [""])[0]
+                resolve_library_book(configured(), relative)
+                operation = form.get("operation", [""])[0]
+                if operation not in ("preview", "optimize"):
+                    raise ValueError("无效操作")
+                if operation == "optimize" and form.get("confirm") != ["on"]:
+                    raise ValueError("重处理需要确认")
+                started = start_job(dry_run=operation == "preview", library_book=relative)
+                message = "已开始预演" if started and operation == "preview" else ("已开始重处理" if started else "已有任务正在执行")
             else:
                 destination, message = self.run_target(form)
         except (ValueError, OSError) as exc:
@@ -445,6 +475,31 @@ class Handler(BaseHTTPRequestHandler):
         output = cfg.komga_library / safe_name(title) / cfg.output_name_template.format(series=safe_name(title))
         body = f'''<a class="breadcrumbs" href="/folders">← 返回文件夹管理</a><div class="detail"><div class="card"><h2>{escape(path.name)}</h2><p>源目录：<code>{escape(path)}</code></p><p>预计输出：<code>{escape(output)}</code></p><p>上次归档：{escape(state.get('merged_at') or '暂无')} · {escape(state.get('pages') or 0)} 页</p></div><div class="card"><h2>文件夹策略</h2><form method="post" action="/policy"><input type="hidden" name="csrf" value="{TOKEN}"><input type="hidden" name="kind" value="folder"><input type="hidden" name="id" value="{escape(relative)}"><label class="field">归档标题 <input name="title" value="{escape(title)}" required maxlength="180"></label><label class="field">处理方式 <select name="mode">{modes}</select></label><button>保存文件夹策略</button></form></div></div><div class="card"><h2>章节清单 · {len(units)} 话</h2><ul>{chapters}</ul></div><div class="card"><h2>定向操作</h2><p>操作只读取此文件夹；仅归档标题决定输出目录和 CBZ 名称。</p>{controls}</div>'''
         return layout("文件夹详情", "/folders", body, message)
+
+    def library_books(self, params, message):
+        cfg = configured()
+        query = params.get("q", [""])[0].strip()[:100].lower()
+        rows = []
+        if cfg.komga_library.is_dir():
+            for root, dirs, files in os.walk(cfg.komga_library, followlinks=False):
+                dirs[:] = [d for d in dirs if not (Path(root) / d).is_symlink()]
+                for name in sorted(files):
+                    if not name.lower().endswith(".cbz"):
+                        continue
+                    path = Path(root) / name
+                    relative = path.relative_to(cfg.komga_library).as_posix()
+                    if query and query not in relative.lower():
+                        continue
+                    if path.is_symlink():
+                        continue
+                    controls = post_form('/optimize', '预演', {'book': relative, 'operation': 'preview'}) + post_form('/optimize', '优化此书', {'book': relative, 'operation': 'optimize'}, 'danger', '确认重处理此 CBZ；请先备份')
+                    rows.append(f'<tr><td><code>{escape(relative)}</code></td><td>{path.stat().st_size / 1048576:.1f} MB</td><td>{controls}</td></tr>')
+                    if len(rows) >= 200:
+                        break
+                if len(rows) >= 200:
+                    break
+        body = f'''<p>仅处理选中的单个原始 CBZ，不批量修改库。建议先备份原文件并预演；分册后请到 Komga 重新扫描。已有分册请从源章节强制重建。</p><p>当前设置：压缩{'开启' if cfg.optimize_images else '关闭'}，最长边约 {cfg.image_max_width}×{cfg.image_max_height}，JPEG 质量 {cfg.image_quality}，每册 {cfg.pages_per_book or '不限'} 页。修改请前往<a href="/settings">功能配置</a>。</p><div class="card"><form method="get" action="/library" class="row"><input name="q" type="search" value="{escape(query)}" placeholder="搜索 CBZ 文件名"><button>搜索</button></form></div><div class="card table-wrap"><table><thead><tr><th>库内文件</th><th>大小</th><th>操作</th></tr></thead><tbody>{''.join(rows)}</tbody></table>{'<div class="empty">暂无匹配的 CBZ。</div>' if not rows else ''}</div>'''
+        return layout("已合并优化", "/library", body, message)
 
     def settings(self, params, message):
         cfg = configured()

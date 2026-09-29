@@ -38,7 +38,10 @@ import zipfile
 import logging
 import hashlib
 import unicodedata
+from io import BytesIO
 import xml.sax.saxutils as saxutils
+import xml.etree.ElementTree as ET
+from PIL import Image, ImageOps, UnidentifiedImageError
 from pathlib import Path
 from datetime import datetime
 
@@ -86,6 +89,14 @@ class Config:
         self.output_name_template = os.environ.get("OUTPUT_NAME_TEMPLATE", "{series}.cbz")
         self.request_timeout = env_int("REQUEST_TIMEOUT", 30)
         self.max_zip_entry_mb = env_int("MAX_ZIP_ENTRY_MB", 200)  # 单页安全上限
+        self.optimize_images = env_bool("OPTIMIZE_IMAGES", False)
+        self.image_max_width = env_int("IMAGE_MAX_WIDTH", 1600)
+        self.image_max_height = env_int("IMAGE_MAX_HEIGHT", 2400)
+        self.image_quality = env_int("IMAGE_QUALITY", 82)
+        self.pages_per_book = env_int("PAGES_PER_BOOK", 0)  # 0 表示不拆分
+        if not (1 <= self.image_quality <= 95 and self.image_max_width > 0 and
+                self.image_max_height > 0 and self.pages_per_book >= 0):
+            raise ValueError("图片质量、尺寸或分册页数配置无效")
 
     @property
     def state_file(self) -> Path:
@@ -474,6 +485,16 @@ def iter_pages(unit: Path, max_bytes: int):
 
 
 def build_comicinfo(meta, page_count):
+    if meta.get("comicinfo") is not None:
+        root = ET.fromstring(meta["comicinfo"])
+        for tag, value in (("Number", meta.get("volume", 1)),
+                           ("Volume", meta.get("volume", 1)), ("PageCount", page_count)):
+            node = root.find(tag)
+            if node is None:
+                node = ET.SubElement(root, tag)
+            node.text = str(value)
+        return ET.tostring(root, encoding="utf-8", xml_declaration=True)
+
     def e(v):
         return saxutils.escape(str(v)) if v not in (None, "") else ""
 
@@ -483,9 +504,9 @@ def build_comicinfo(meta, page_count):
         'xmlns:xsd="http://www.w3.org/2001/XMLSchema">',
         f"  <Title>{e(meta.get('title'))}</Title>",
         f"  <Series>{e(meta.get('series'))}</Series>",
-        "  <Number>1</Number>",
-        "  <Volume>1</Volume>",
-        "  <Count>1</Count>",
+        f"  <Number>{int(meta.get('volume', 1))}</Number>",
+        f"  <Volume>{int(meta.get('volume', 1))}</Volume>",
+        f"  <Count>{int(meta.get('count', 1))}</Count>",
         f"  <PageCount>{page_count}</PageCount>",
     ]
     if meta.get("writer"):
@@ -516,23 +537,154 @@ def chapter_fingerprint(units):
     return sha1_of("\n".join(items))
 
 
-def merge_book(units, out_path: Path, meta, cfg: Config):
-    """把章节单元合并为单个 CBZ 文件。返回写入的页数。"""
-    out_path.parent.mkdir(parents=True, exist_ok=True)
-    tmp_path = out_path.with_suffix(out_path.suffix + ".tmp")
-    idx = 0
+def optimization_signature(cfg):
+    return [cfg.optimize_images, cfg.image_max_width, cfg.image_max_height,
+            cfg.image_quality, cfg.pages_per_book]
+
+
+def optimize_page(name, data, cfg):
+    """只在输出更小时采用 JPEG；动图和无法识别的格式保持原样。"""
+    if not cfg.optimize_images or Path(name).suffix.lower() == ".gif":
+        return name, data
     try:
-        with zipfile.ZipFile(tmp_path, "w", zipfile.ZIP_STORED) as zout:
-            for unit in units:
-                for orig_name, data in iter_pages(unit, cfg.max_zip_entry_mb * 1024 * 1024):
-                    idx += 1
-                    ext = os.path.splitext(orig_name)[1].lower() or ".jpg"
-                    zout.writestr(f"{idx:05d}{ext}", data)
-            zout.writestr("ComicInfo.xml", build_comicinfo(meta, idx))
-        os.replace(tmp_path, out_path)  # 原子替换
-        return idx
+        with Image.open(BytesIO(data)) as source:
+            source.load()
+            if getattr(source, "is_animated", False):
+                return name, data
+            image = ImageOps.exif_transpose(source)
+            image.thumbnail((cfg.image_max_width, cfg.image_max_height), Image.Resampling.LANCZOS)
+            if image.mode in ("RGBA", "LA") or (image.mode == "P" and "transparency" in image.info):
+                background = Image.new("RGB", image.size, "white")
+                background.paste(image.convert("RGBA"), mask=image.convert("RGBA").getchannel("A"))
+                image = background
+            else:
+                image = image.convert("RGB")
+            buffer = BytesIO()
+            image.save(buffer, format="JPEG", quality=cfg.image_quality, optimize=True)
+            encoded = buffer.getvalue()
+            if len(encoded) < len(data):
+                return str(Path(name).with_suffix(".jpg")), encoded
+    except (UnidentifiedImageError, OSError, ValueError, Image.DecompressionBombError) as exc:
+        log.warning("图片 %s 无法重编码，保留原图：%s", name, exc)
+    return name, data
+
+
+def book_paths(out_path, count):
+    return [out_path] if count == 1 else [out_path.with_name(f"{out_path.stem} - {n:03d}{out_path.suffix}")
+                                           for n in range(1, count + 1)]
+
+
+def merge_book(units, out_path: Path, meta, cfg: Config, old_paths=()):
+    """分卷流式写入临时文件，全部生成成功后再发布。返回页数与文件路径。"""
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    staged = []
+    zout = None
+    count = 0
+    volume_pages = 0
+    try:
+        for unit in units:
+            for orig_name, data in iter_pages(unit, cfg.max_zip_entry_mb * 1024 * 1024):
+                if zout is None or (cfg.pages_per_book and volume_pages >= cfg.pages_per_book):
+                    if zout:
+                        zout.writestr("ComicInfo.xml", build_comicinfo(dict(meta, volume=len(staged)), volume_pages))
+                        zout.close()
+                    temp = out_path.with_name(f".{out_path.name}.part-{len(staged) + 1:03d}.tmp")
+                    if temp.exists():
+                        raise ValueError(f"存在未完成的临时文件：{temp}，请检查后移走")
+                    zout = zipfile.ZipFile(temp, "w", zipfile.ZIP_STORED, allowZip64=True)
+                    staged.append(temp)
+                    volume_pages = 0
+                name, data = optimize_page(orig_name, data, cfg)
+                count += 1
+                volume_pages += 1
+                zout.writestr(f"{volume_pages:05d}{Path(name).suffix.lower() or '.jpg'}", data)
+        if zout:
+            zout.writestr("ComicInfo.xml", build_comicinfo(dict(meta, volume=len(staged)), volume_pages))
+            zout.close()
+            zout = None
+        if not count:
+            raise ValueError("未找到图片，拒绝创建空归档")
+        paths = book_paths(out_path, len(staged))
+        owned = set(old_paths)
+        for path in paths:
+            if path.is_symlink() or (path.exists() and path not in owned):
+                raise ValueError(f"已有非本任务文件，拒绝覆盖：{path}")
+        for path in owned:
+            if path.is_symlink():
+                raise ValueError(f"旧输出是符号链接，拒绝覆盖：{path}")
+        # 保留旧文件作回滚，成功发布后再清理；失败时还原旧文件。
+        backups = []
+        published = []
+        try:
+            for path in owned:
+                if path.exists():
+                    backup = path.with_name(f".{path.name}.archive-backup")
+                    if backup.exists():
+                        raise ValueError(f"存在待恢复备份：{backup}")
+                    os.replace(path, backup)
+                    backups.append((path, backup))
+            for temp, path in zip(staged, paths):
+                os.replace(temp, path)
+                published.append(path)
+        except Exception:
+            for path in published:
+                path.unlink(missing_ok=True)
+            for path, backup in backups:
+                os.replace(backup, path)
+            raise
+        for _, backup in backups:
+            backup.unlink()
+        return count, paths
     finally:
-        tmp_path.unlink(missing_ok=True)
+        if zout:
+            zout.close()
+        for temp in staged:
+            temp.unlink(missing_ok=True)
+
+
+def resolve_library_book(cfg, relative):
+    """仅允许处理 Komga 库下的普通 CBZ 文件。"""
+    if not relative or Path(relative).is_absolute() or "\\" in relative or any(
+        p in (".", "..") for p in Path(relative).parts
+    ):
+        raise ValueError("无效的漫画文件路径")
+    root = cfg.komga_library.resolve()
+    path = cfg.komga_library / relative
+    path.resolve().relative_to(root)
+    current = cfg.komga_library
+    for part in Path(relative).parts:
+        current = current / part
+        if current.is_symlink():
+            raise ValueError("不允许符号链接")
+    if not path.is_file() or path.suffix.lower() != ".cbz":
+        raise ValueError("只能选择库中的 CBZ 文件")
+    return path
+
+
+def optimize_existing_book(cfg, relative, dry_run=False):
+    source = resolve_library_book(cfg, relative)
+    with zipfile.ZipFile(source) as zf:
+        names = sorted((n for n in zf.namelist() if Path(n).suffix.lower() in IMG_EXTS
+                        and not n.endswith("/")), key=natural_key)
+        if not names:
+            raise ValueError("CBZ 中没有图片")
+        count = len(names)
+        comicinfo = next((n for n in zf.namelist() if n.lower() == "comicinfo.xml"), None)
+        original_meta = zf.read(comicinfo) if comicinfo and zf.getinfo(comicinfo).file_size < 1048576 else None
+        if original_meta is not None:
+            ET.fromstring(original_meta)
+    if dry_run:
+        return {"pages": count, "books": (count - 1) // cfg.pages_per_book + 1 if cfg.pages_per_book else 1,
+                "source_mb": round(source.stat().st_size / 1048576, 1)}
+    # 只重处理单本，不能将已有的分册当成整本；分册用原始章节强制重建。
+    if source.name.rsplit(" - ", 1)[-1].replace(".cbz", "").isdigit():
+        raise ValueError("此文件可能是分册，请从下载章节重新归档，而非处理单个分册")
+    original_size = source.stat().st_size
+    meta = {"series": source.parent.name, "title": source.parent.name,
+            "manga_mode": cfg.manga_mode, "comicinfo": original_meta}
+    count, paths = merge_book([source], source, meta, cfg, old_paths=[source])
+    return {"pages": count, "books": len(paths), "source_mb": round(original_size / 1048576, 1),
+            "output_mb": round(sum(p.stat().st_size for p in paths) / 1048576, 1)}
 
 
 # ---------------------------------------------------------------------------
@@ -654,16 +806,22 @@ def run_once(cfg: Config, target=None, folder=None, force=False) -> dict:
             continue
 
         prev = state.get(key)
-        if any(other_key != key and record.get("output") == str(out_path)
+        if any(other_key != key and (record.get("output") == str(out_path) or
+                str(out_path) in record.get("outputs", []))
                for other_key, record in state.items() if isinstance(record, dict)):
             log.error("输出 %s 已归属另一个漫画或文件夹，拒绝覆盖；请修改文件夹归档标题", out_path)
             stats["failed"] += 1
             continue
-        if out_path.exists() and prev is None:
+        old_paths = [Path(p) for p in prev.get("outputs", [prev.get("output", "")]) if p] if prev else []
+        if any(p.parent != out_path.parent or p.suffix.lower() != ".cbz" for p in old_paths):
+            log.error("记录中的旧输出路径无效，拒绝覆盖：%s", old_paths)
+            stats["failed"] += 1
+            continue
+        if out_path.exists() and out_path not in old_paths:
             log.error("输出 %s 已存在但没有匹配的归档记录，拒绝覆盖", out_path)
             stats["failed"] += 1
             continue
-        if not force and prev and prev.get("fingerprint") == fp and out_path.exists():
+        if not force and prev and prev.get("fingerprint") == fp and prev.get("optimization") == optimization_signature(cfg) and all(p.exists() for p in old_paths):
             log.info("「%s」无变化，跳过（%d 话）", title, len(units))
             stats["skipped"] += 1
             continue
@@ -683,7 +841,7 @@ def run_once(cfg: Config, target=None, folder=None, force=False) -> dict:
             "manga_mode": cfg.manga_mode,
         }
         try:
-            pages = merge_book(units, out_path, meta, cfg)
+            pages, outputs = merge_book(units, out_path, meta, cfg, old_paths)
         except Exception as e:  # noqa
             log.exception("合并失败：%s", e)
             stats["failed"] += 1
@@ -708,6 +866,8 @@ def run_once(cfg: Config, target=None, folder=None, force=False) -> dict:
             "chapters": len(units),
             "pages": pages,
             "output": str(out_path),
+            "outputs": [str(p) for p in outputs],
+            "optimization": optimization_signature(cfg),
             "fingerprint": fp,
             "reason": reason,
             "merged_at": datetime.now().isoformat(timespec="seconds"),

@@ -1,0 +1,95 @@
+# =============================================================================
+# NAS 漫画一条龙：Suwayomi（下载） + Komga（书库） + Manga Archiver（完结自动整本合并）
+# 适用于极空间 / 群晖 / 威联通等支持 Docker Compose 的 NAS
+#
+# 极空间部署方式：Docker 应用 → Compose → 新增项目
+#   1) 先在「文件管理器 → Docker」下新建一个文件夹，例如 nas-manga，
+#      并把本目录（含 archiver 子目录）整个上传进去。
+#   2) 在 Compose「新增项目」里选择该文件夹作为存储位置，粘贴本文件内容，点「创建」。
+#   3) 首次启动后访问 http://NAS_IP:25600 注册 Komga 管理员；
+#      访问 http://NAS_IP:4567 配置 Suwayomi（安装扩展、开启下载）。
+#
+# 目录约定（相对项目目录）：
+#   ./suwayomi/downloads   Suwayomi 下载的每话 CBZ（archiver 的输入）
+#   ./suwayomi/data        Suwayomi 数据/数据库
+#   ./komga/library        Komga 漫画库（archiver 的输出、Komga 的 /books）
+#   ./komga/config         Komga 配置
+#   ./config               archiver 的配置、状态与手动清单
+#   ./                    archiver 的 Dockerfile 与脚本
+# =============================================================================
+
+services:
+  # --------------------------- 1) Suwayomi 下载服务 ---------------------------
+  suwayomi:
+    image: ghcr.io/suwayomi/suwayomi-server:stable
+    container_name: suwayomi
+    user: "0:0"                      # 极空间下用 root 避免权限问题；如需非 root 改成 1000:1000 并 chown
+    environment:
+      - TZ=Asia/Shanghai
+      - BIND_IP=0.0.0.0
+      - BIND_PORT=4567
+      - DOWNLOAD_AS_CBZ=true         # 关键：每话下载为单个 CBZ
+      - AUTO_DOWNLOAD_CHAPTERS=true  # 自动下载新章节（追更）
+      - UPDATE_INTERVAL=12           # 每 12 小时检查一次更新
+      - FLARESOLVERR_ENABLED=true
+      - FLARESOLVERR_URL=http://flaresolverr:8191
+    volumes:
+      # 官方要求 downloads 放在 volumes 列表第一行
+      - ./suwayomi/downloads:/home/suwayomi/.local/share/Tachidesk/downloads
+      - ./suwayomi/data:/home/suwayomi/.local/share/Tachidesk
+    ports:
+      - "4567:4567"
+    restart: unless-stopped
+
+  # --------------------- 2) FlareSolverr 过 Cloudflare ------------------------
+  flaresolverr:
+    image: ghcr.io/flaresolverr/flaresolverr:latest
+    container_name: flaresolverr
+    environment:
+      - TZ=Asia/Shanghai
+      - LOG_LEVEL=info
+    ports:
+      - "8191:8191"
+    restart: unless-stopped
+
+  # ----------------------------- 3) Komga 书库 ------------------------------
+  komga:
+    image: gotson/komga:latest
+    container_name: komga
+    environment:
+      - TZ=Asia/Shanghai
+    volumes:
+      - ./komga/config:/config
+      - ./komga/library:/books
+    ports:
+      - "25600:25600"
+    restart: unless-stopped
+
+  # ------------------ 4) 漫画归档器（完结自动整本合并） ----------------------
+  archiver:
+    build: .
+    image: nas-manga-archiver:local
+    container_name: manga-archiver
+    environment:
+      - TZ=Asia/Shanghai
+      - SUWAYOMI_URL=http://suwayomi:4567
+      - DOWNLOAD_DIR=/downloads
+      - KOMGA_LIBRARY=/komga-library
+      - CONFIG_DIR=/config
+      - INTERVAL_SECONDS=21600          # 每 6 小时检查一次；0 表示只跑一次
+      - COMPLETED_STATUSES=COMPLETED,PUBLISHING_FINISHED
+      - COMPLETED_CATEGORY=已完结        # Suwayomi 中该分类下的漫画视为已完结
+      - MANGA_MODE=YesAndRightToLeft     # 写入 ComicInfo 的阅读方向；不需要可留空
+      - MOVE_SOURCE=false                # 合并后是否删除源章节（默认保留母本）
+      - DRY_RUN=false
+      - WEBUI_PASSWORD=${WEBUI_PASSWORD:?Set WEBUI_PASSWORD before starting}
+    ports:
+      - "${WEBUI_BIND:-127.0.0.1}:8765:8765"
+    volumes:
+      - ./suwayomi/downloads:/downloads:ro        # 只读输入；如启用 MOVE_SOURCE 须改为可写
+      - ./komga/library:/komga-library            # 写 Komga 漫画库
+      - ./config:/config                          # 配置、状态与手动清单
+    depends_on:
+      - suwayomi
+      - komga
+    restart: unless-stopped

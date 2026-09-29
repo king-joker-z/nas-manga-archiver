@@ -1,0 +1,42 @@
+# =============================================================================
+# 只跑 archiver（你的 Suwayomi 与 Komga 已经单独装好了）
+# =============================================================================
+# 关键点：archiver 现在不属于 Suwayomi/Komga 所在的 compose 网络，
+# 因此它连 Suwayomi 要用「NAS 的 IP + 端口」，而不是容器名。
+#
+# 极空间部署：Docker 应用 → Compose → 新增项目，项目存储位置选你放本文件的文件夹。
+#
+# 需要你确认并替换的三处（下面都用 ★ 标出）：
+#   ★1 SUWAYOMI_URL       你的 Suwayomi 访问地址（NAS_IP + 端口）
+#   ★2 下载目录宿主机路径  你 Suwayomi 容器里 downloads 对应的 NAS 实际文件夹
+#   ★3 漫画库宿主机路径    你 Komga 容器里 /books 对应的 NAS 实际文件夹
+# =============================================================================
+
+services:
+  archiver:
+    build: .                          # Dockerfile 与 archiver.py 位于项目根目录
+    image: nas-manga-archiver:local
+    container_name: manga-archiver
+    environment:
+      - TZ=Asia/Shanghai
+      - SUWAYOMI_URL=http://192.168.1.100:4567        # ★1 改成你的 Suwayomi 地址
+      - DOWNLOAD_DIR=/downloads
+      - KOMGA_LIBRARY=/komga-library
+      - CONFIG_DIR=/config
+      - INTERVAL_SECONDS=21600          # 每 6 小时跑一次；设为 0 = 只跑一次后退出
+      - COMPLETED_STATUSES=COMPLETED,PUBLISHING_FINISHED
+      - COMPLETED_CATEGORY=已完结        # Suwayomi 里这个分类下的漫画视为已完结
+      - MANGA_MODE=YesAndRightToLeft     # 写入 ComicInfo 的阅读方向，留空则不写
+      - MOVE_SOURCE=false                # 合并后是否删除源章节（默认保留母本）
+      - DRY_RUN=false
+      - WEBUI_PASSWORD=${WEBUI_PASSWORD:?Set WEBUI_PASSWORD before starting}
+      # 若 Suwayomi 开了 basic_auth，取消下面两行注释并填账号密码：
+      # - SUWAYOMI_USER=你的用户名
+      # - SUWAYOMI_PASS=你的密码
+    ports:
+      - "${WEBUI_BIND:-127.0.0.1}:8765:8765"
+    volumes:
+      - /你的路径/suwayomi/downloads:/downloads:ro        # ★2 Suwayomi 下载目录（宿主机实际路径）
+      - /你的路径/komga/library:/komga-library          # ★3 Komga 漫画库（宿主机实际路径）
+      - ./config:/config                                # 配置、状态与手动清单
+    restart: unless-stopped

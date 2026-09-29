@@ -29,9 +29,12 @@ MANUAL_FILE = CONFIG_DIR / "manual_completed.txt"
 POLICIES_FILE = CONFIG_DIR / "policies.json"
 PASSWORD = os.environ.get("WEBUI_PASSWORD", "")
 TOKEN = secrets.token_urlsafe(32)
+SCRIPT_NONCE = secrets.token_urlsafe(24)
 LOCK = threading.RLock()
 HISTORY = deque(maxlen=50)
 RUNNING = False
+PROGRESS = {"status": "idle", "label": "", "stage": "尚无任务", "title": "",
+            "pages_done": 0, "pages_total": 0, "volume": 0, "started_at": None, "message": ""}
 LAST_RUN = None
 NEXT_RUN = None
 MAX_BODY = 65536
@@ -148,15 +151,32 @@ def folder_details(cfg, relative):
     return path, units
 
 
+def report_progress(**updates):
+    with LOCK:
+        PROGRESS.update(updates)
+
+
+def progress_snapshot():
+    with LOCK:
+        data = PROGRESS.copy()
+        data["running"] = RUNNING
+    data["elapsed_seconds"] = max(0, int(time.time() - data["started_at"])) if data["started_at"] else 0
+    total = data["pages_total"]
+    data["percent"] = min(100, int(data["pages_done"] * 100 / total)) if total else None
+    return data
+
+
 def run_job(dry_run=False, target=None, folder=None, force=False, library_book=None):
     global RUNNING, LAST_RUN
     label = f"库内文件 {library_book}" if library_book else (f"漫画 #{target}" if target is not None else (f"文件夹 {folder}" if folder else "自动巡检"))
+    succeeded = False
     try:
         cfg = configured()
         if target is not None or folder is not None or library_book:
             cfg.dry_run = dry_run
         if library_book:
-            stats = optimize_existing_book(cfg, library_book, dry_run=dry_run)
+            stats = optimize_existing_book(cfg, library_book, dry_run=dry_run,
+                                           progress=report_progress)
             if not dry_run:
                 state = load_state(cfg.state_file)
                 source = str(cfg.komga_library / library_book)
@@ -166,7 +186,9 @@ def run_job(dry_run=False, target=None, folder=None, force=False, library_book=N
                         record["optimization"] = optimization_signature(cfg)
                 save_state(cfg.state_file, state)
         else:
-            stats = run_once(cfg, target=target, folder=folder, force=force)
+            stats = run_once(cfg, target=target, folder=folder, force=force,
+                             progress=report_progress)
+        succeeded = not stats.get("failed", 0)
         message = f"{datetime.now():%m-%d %H:%M} · {label} · {'预演' if cfg.dry_run else '归档'} · {stats}"
     except Exception as exc:
         log.exception("归档任务失败")
@@ -175,6 +197,8 @@ def run_job(dry_run=False, target=None, folder=None, force=False, library_book=N
         HISTORY.appendleft(message)
         LAST_RUN = datetime.now()
         RUNNING = False
+        PROGRESS.update(status="completed" if succeeded else "failed",
+                        stage="已完成" if succeeded else "任务失败", message=message)
 
 
 def start_job(dry_run=False, target=None, folder=None, force=False, library_book=None):
@@ -183,6 +207,11 @@ def start_job(dry_run=False, target=None, folder=None, force=False, library_book
         if RUNNING:
             return False
         RUNNING = True
+        PROGRESS.update(status="running", label=(f"库内文件 {library_book}" if library_book else
+                        f"漫画 #{target}" if target is not None else
+                        f"文件夹 {folder}" if folder else "自动巡检"),
+                        stage="等待任务启动", title="", pages_done=0, pages_total=0,
+                        volume=0, started_at=time.time(), message="")
     threading.Thread(target=run_job, args=(dry_run, target, folder, force, library_book), daemon=True).start()
     return True
 
@@ -209,6 +238,37 @@ STYLE = """
 :root{font-family:Inter,system-ui,-apple-system,sans-serif;color:#eaf0fb;background:#0c1220}*{box-sizing:border-box}body{margin:0}a{color:inherit;text-decoration:none}.shell{min-height:100vh;display:flex}aside{width:224px;background:#10192a;border-right:1px solid #24334b;padding:32px 16px;position:sticky;top:0;height:100vh}aside strong{display:block;font-size:20px;margin:0 12px 10px}aside small{display:block;margin:0 12px 42px;color:#8294b3}nav a{display:block;color:#aebbd0;padding:13px 15px;border-radius:11px;margin:4px 0}nav a.active,nav a:hover{color:#fff;background:#253751}main{max-width:1180px;width:100%;margin:0 auto;padding:34px 36px 80px}header{display:flex;justify-content:space-between;align-items:center;gap:16px;margin-bottom:26px}h1{margin:0;font-size:30px;letter-spacing:-.04em}h2{font-size:19px;margin:0 0 16px}h3{font-size:15px;margin:0 0 12px}p,small{color:#9daec8;line-height:1.6}.eyebrow{font-size:12px;letter-spacing:.12em;color:#83d9b3;text-transform:uppercase;font-weight:700}.badge{border-radius:99px;padding:7px 12px;font-size:12px;background:#173c37;color:#91eac1;white-space:nowrap}.muted{color:#9baac1}.card{background:#151f31;border:1px solid #2b3b52;border-radius:16px;padding:22px;margin:18px 0}.grid{display:grid;grid-template-columns:repeat(3,1fr);gap:16px}.grid .card{margin:0}.metric{font-size:30px;font-weight:750;margin-top:6px}.notice{background:#183f38;color:#c5ffdf;border:1px solid #377a67;border-radius:12px;padding:14px;margin-bottom:20px}.warning{background:#4a3422;color:#ffe6ba;border-color:#80633a}.row{display:flex;gap:12px;align-items:center;flex-wrap:wrap}.spaced{justify-content:space-between}.button,button{background:#83dfae;color:#08211a;display:inline-block;border:0;border-radius:9px;padding:9px 15px;font:inherit;font-weight:700;cursor:pointer}.button.secondary,button.secondary{background:#273b56;color:#e8f0ff}.button.danger,button.danger{background:#4a303a;color:#ffdce0}form.inline{display:inline-block;margin-right:6px}input,select,textarea{background:#0d1626;color:#eef4ff;border:1px solid #40546e;border-radius:8px;padding:10px;font:inherit;max-width:100%}input[type=checkbox]{width:18px;height:18px;accent-color:#83dfae}input[type=search]{width:320px}textarea{width:100%;min-height:145px;resize:vertical}label.field{display:flex;justify-content:space-between;align-items:center;gap:12px;border-bottom:1px solid #26374b;padding:13px 0}label.field input:not([type=checkbox]),label.field select{width:50%}.table-wrap{overflow:auto}table{width:100%;border-collapse:collapse}th{text-align:left;color:#8296b5;font-size:12px;font-weight:600}td,th{padding:14px 11px;border-bottom:1px solid #29374a;vertical-align:middle}td.actions{white-space:nowrap}code{color:#b3d4ef;overflow-wrap:anywhere}ul{padding-left:20px;line-height:1.9}.chip{background:#27364c;color:#b4c4db;border-radius:7px;padding:4px 8px;font-size:12px}.section-title{display:flex;justify-content:space-between;align-items:center;margin-bottom:18px}.empty{padding:32px;text-align:center;color:#9baac1}.detail{display:grid;grid-template-columns:1fr 1fr;gap:18px}.detail .card{margin:0}.breadcrumbs{color:#9baac1;margin-bottom:17px;display:block}.danger-note{color:#ffc5a1}@media(max-width:800px){.shell{display:block}aside{width:auto;height:auto;position:static;padding:16px}aside small{margin-bottom:14px}nav{display:flex;overflow:auto}nav a{white-space:nowrap}main{padding:24px 16px}.grid,.detail{grid-template-columns:1fr}header{align-items:flex-start}label.field{display:block}label.field input:not([type=checkbox]),label.field select{width:100%;margin-top:8px}}
 """
 
+PROGRESS_SCRIPT = """
+const panel = document.getElementById('job-progress');
+const meter = document.getElementById('job-meter');
+const details = document.getElementById('job-details');
+const summary = document.getElementById('job-summary');
+async function refreshProgress() {
+  try {
+    const response = await fetch('/progress', {cache: 'no-store'});
+    if (!response.ok) throw new Error('无法读取任务状态');
+    const state = await response.json();
+    panel.hidden = state.status === 'idle';
+    if (panel.hidden) return;
+    const label = state.title || state.label;
+    const pages = state.pages_total ? ` · ${state.pages_done} / ${state.pages_total} 页 (${state.percent}%)` : '';
+    const volume = state.volume ? ` · 第 ${state.volume} 册` : '';
+    details.textContent = `${label} · ${state.stage}${pages}${volume} · 已用 ${state.elapsed_seconds} 秒`;
+    summary.textContent = state.running ? '正在处理，请勿重复提交任务' : state.message;
+    if (state.pages_total) {
+      meter.value = state.pages_done;
+      meter.max = state.pages_total;
+    } else {
+      meter.removeAttribute('value');
+    }
+  } catch (error) {
+    details.textContent = `进度获取失败：${error.message}`;
+  }
+}
+refreshProgress();
+setInterval(refreshProgress, 1500);
+"""
+
 
 def post_form(action, label, fields=None, style="secondary", confirm=""):
     hidden = f'<input type="hidden" name="csrf" value="{TOKEN}">'
@@ -227,7 +287,7 @@ def layout(title, section, body, message="", warning=False):
     notice = f'<div class="notice {"warning" if warning else ""}">{escape(message)}</div>' if message else ""
     with LOCK:
         running = RUNNING
-    return f'''<!doctype html><html lang="zh-CN"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>{escape(title)} · Manga Archiver</title><style>{STYLE}</style></head><body><div class="shell"><aside><strong>◈ Manga Archive</strong><small>Suwayomi → Komga</small><nav>{nav_link('/', '◫　控制台', section)}{nav_link('/mangas', '▤　漫画管理', section)}{nav_link('/folders', '▥　文件夹管理', section)}{nav_link('/library', '▧　已合并优化', section)}{nav_link('/settings', '⚙　功能配置', section)}</nav></aside><main><header><div><div class="eyebrow">LIBRARY CONTROL CENTER</div><h1>{escape(title)}</h1></div><span class="badge">{'● 正在执行' if running else '● 系统空闲'}</span></header>{notice}{body}</main></div></body></html>'''
+    return f'''<!doctype html><html lang="zh-CN"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>{escape(title)} · Manga Archiver</title><style>{STYLE}</style></head><body><div class="shell"><aside><strong>◈ Manga Archive</strong><small>Suwayomi → Komga</small><nav>{nav_link('/', '◫　控制台', section)}{nav_link('/mangas', '▤　漫画管理', section)}{nav_link('/folders', '▥　文件夹管理', section)}{nav_link('/library', '▧　已合并优化', section)}{nav_link('/settings', '⚙　功能配置', section)}</nav></aside><main><header><div><div class="eyebrow">LIBRARY CONTROL CENTER</div><h1>{escape(title)}</h1></div><span class="badge">{'● 正在执行' if running else '● 系统空闲'}</span></header>{notice}<section id="job-progress" class="card" hidden><h2>任务进度</h2><p id="job-details" role="status" aria-live="polite">正在读取进度…</p><progress id="job-meter" style="width:100%;height:18px;accent-color:#83dfae"></progress><p id="job-summary"></p></section>{body}</main></div><script nonce="{SCRIPT_NONCE}">{PROGRESS_SCRIPT}</script></body></html>'''
 
 
 class Handler(BaseHTTPRequestHandler):
@@ -246,7 +306,7 @@ class Handler(BaseHTTPRequestHandler):
         self.send_header("Content-Length", str(len(payload)))
         self.send_header("Cache-Control", "no-store")
         self.send_header("X-Content-Type-Options", "nosniff")
-        self.send_header("Content-Security-Policy", "default-src 'none'; style-src 'unsafe-inline'; form-action 'self'; base-uri 'none'; frame-ancestors 'none'")
+        self.send_header("Content-Security-Policy", f"default-src 'none'; connect-src 'self'; script-src 'nonce-{SCRIPT_NONCE}'; style-src 'unsafe-inline'; form-action 'self'; base-uri 'none'; frame-ancestors 'none'")
         self.end_headers()
         self.wfile.write(payload)
 
@@ -268,6 +328,10 @@ class Handler(BaseHTTPRequestHandler):
         try:
             if url.path == "/healthz":
                 self.respond(200, "ok", "text/plain; charset=utf-8")
+                return
+            if url.path == "/progress":
+                self.respond(200, json.dumps(progress_snapshot(), ensure_ascii=False),
+                             "application/json; charset=utf-8")
                 return
             pages = {"/": self.dashboard, "/mangas": self.mangas, "/folders": self.folders,
                      "/manga": self.manga_detail, "/folder": self.folder_detail, "/settings": self.settings,

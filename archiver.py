@@ -574,9 +574,27 @@ def book_paths(out_path, count):
                                            for n in range(1, count + 1)]
 
 
-def merge_book(units, out_path: Path, meta, cfg: Config, old_paths=()):
+def count_pages(units):
+    """只读取章节目录和 ZIP 索引，不读取图片内容。"""
+    total = 0
+    for unit in units:
+        if unit.is_file():
+            with zipfile.ZipFile(unit) as zf:
+                total += sum(not info.is_dir() and Path(info.filename).suffix.lower() in IMG_EXTS
+                             for info in zf.infolist())
+        else:
+            total += sum(p.is_file() and p.suffix.lower() in IMG_EXTS for p in unit.iterdir())
+    return total
+
+
+def merge_book(units, out_path: Path, meta, cfg: Config, old_paths=(), progress=None, total_pages=None):
     """分卷流式写入临时文件，全部生成成功后再发布。返回页数与文件路径。"""
     out_path.parent.mkdir(parents=True, exist_ok=True)
+    if progress:
+        progress(stage="统计页数", pages_done=0, pages_total=0)
+        if total_pages is None:
+            total_pages = count_pages(units)
+        progress(stage="压缩并写入", pages_done=0, pages_total=total_pages, volume=0)
     staged = []
     zout = None
     count = 0
@@ -598,6 +616,9 @@ def merge_book(units, out_path: Path, meta, cfg: Config, old_paths=()):
                 count += 1
                 volume_pages += 1
                 zout.writestr(f"{volume_pages:05d}{Path(name).suffix.lower() or '.jpg'}", data)
+                if progress:
+                    progress(stage="压缩并写入", pages_done=count, pages_total=total_pages,
+                             volume=len(staged))
         if zout:
             zout.writestr("ComicInfo.xml", build_comicinfo(dict(meta, volume=len(staged)), volume_pages))
             zout.close()
@@ -612,6 +633,8 @@ def merge_book(units, out_path: Path, meta, cfg: Config, old_paths=()):
         for path in owned:
             if path.is_symlink():
                 raise ValueError(f"旧输出是符号链接，拒绝覆盖：{path}")
+        if progress:
+            progress(stage="发布文件", pages_done=count, pages_total=total_pages, volume=len(staged))
         # 保留旧文件作回滚，成功发布后再清理；失败时还原旧文件。
         backups = []
         published = []
@@ -661,8 +684,10 @@ def resolve_library_book(cfg, relative):
     return path
 
 
-def optimize_existing_book(cfg, relative, dry_run=False):
+def optimize_existing_book(cfg, relative, dry_run=False, progress=None):
     source = resolve_library_book(cfg, relative)
+    if progress:
+        progress(stage="读取 CBZ 目录", pages_done=0, pages_total=0, volume=0)
     with zipfile.ZipFile(source) as zf:
         names = sorted((n for n in zf.namelist() if Path(n).suffix.lower() in IMG_EXTS
                         and not n.endswith("/")), key=natural_key)
@@ -673,6 +698,9 @@ def optimize_existing_book(cfg, relative, dry_run=False):
         original_meta = zf.read(comicinfo) if comicinfo and zf.getinfo(comicinfo).file_size < 1048576 else None
         if original_meta is not None:
             ET.fromstring(original_meta)
+    if progress:
+        progress(stage="目录统计完成" if dry_run else "准备优化", pages_done=0,
+                 pages_total=count, volume=0)
     if dry_run:
         return {"pages": count, "books": (count - 1) // cfg.pages_per_book + 1 if cfg.pages_per_book else 1,
                 "source_mb": round(source.stat().st_size / 1048576, 1)}
@@ -682,7 +710,8 @@ def optimize_existing_book(cfg, relative, dry_run=False):
     original_size = source.stat().st_size
     meta = {"series": source.parent.name, "title": source.parent.name,
             "manga_mode": cfg.manga_mode, "comicinfo": original_meta}
-    count, paths = merge_book([source], source, meta, cfg, old_paths=[source])
+    count, paths = merge_book([source], source, meta, cfg, old_paths=[source],
+                              progress=progress, total_pages=count)
     return {"pages": count, "books": len(paths), "source_mb": round(original_size / 1048576, 1),
             "output_mb": round(sum(p.stat().st_size for p in paths) / 1048576, 1)}
 
@@ -709,10 +738,12 @@ def save_state(path: Path, state):
 # ---------------------------------------------------------------------------
 # 主流程
 # ---------------------------------------------------------------------------
-def run_once(cfg: Config, target=None, folder=None, force=False) -> dict:
+def run_once(cfg: Config, target=None, folder=None, force=False, progress=None) -> dict:
     stats = {"completed": 0, "merged": 0, "skipped": 0, "failed": 0}
     log.info("=" * 60)
     log.info("漫画归档器开始运行  dry_run=%s  move_source=%s", cfg.dry_run, cfg.move_source)
+    if progress:
+        progress(stage="扫描下载目录", pages_done=0, pages_total=0, volume=0)
 
     if not cfg.download_dir.exists():
         log.error("下载目录不存在：%s", cfg.download_dir)
@@ -751,6 +782,9 @@ def run_once(cfg: Config, target=None, folder=None, force=False) -> dict:
 
     handled_folders = set()
     for manga_id, title, reason in completed:
+        if progress:
+            progress(stage="检查归档任务", title=title or "未知作品", pages_done=0,
+                     pages_total=0, volume=0)
         if not title:
             continue
         entry = manga_policies.get(str(manga_id), {}) if manga_id is not None else {}
@@ -831,6 +865,8 @@ def run_once(cfg: Config, target=None, folder=None, force=False) -> dict:
             title, len(units), reason, out_path,
         )
         if cfg.dry_run:
+            if progress:
+                progress(stage="预演完成", pages_done=0, pages_total=0, volume=0)
             stats["merged"] += 1
             continue
 
@@ -841,7 +877,7 @@ def run_once(cfg: Config, target=None, folder=None, force=False) -> dict:
             "manga_mode": cfg.manga_mode,
         }
         try:
-            pages, outputs = merge_book(units, out_path, meta, cfg, old_paths)
+            pages, outputs = merge_book(units, out_path, meta, cfg, old_paths, progress=progress)
         except Exception as e:  # noqa
             log.exception("合并失败：%s", e)
             stats["failed"] += 1
